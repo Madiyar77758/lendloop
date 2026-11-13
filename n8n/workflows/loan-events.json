@@ -1,0 +1,288 @@
+{
+  "id": "lendloop-loan-events",
+  "name": "LendLoop - Loan events",
+  "active": true,
+  "nodes": [
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "lendloop/loan-events",
+        "responseMode": "responseNode",
+        "options": {
+          "rawBody": true
+        }
+      },
+      "name": "Loan event webhook",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [
+        0,
+        200
+      ],
+      "webhookId": "lendloop-loan-events"
+    },
+    {
+      "parameters": {
+        "jsCode": "const crypto = require('crypto');\nconst MAX_SKEW_SECONDS = 300;\nconst reject = (reason) => [{ json: { valid: false, reason } }];\n\nconst secret = $env.N8N_WEBHOOK_SECRET;\nif (!secret) return reject('N8N_WEBHOOK_SECRET is not set');\n\nconst headers = $input.first().json.headers || {};\nconst timestamp = String(headers['x-lendloop-timestamp'] || '');\nconst signature = String(headers['x-lendloop-signature'] || '');\n\nif (!/^\\d{9,12}$/.test(timestamp)) return reject('missing or malformed timestamp');\nif (Math.abs(Date.now() / 1000 - Number(timestamp)) > MAX_SKEW_SECONDS) return reject('stale timestamp (possible replay)');\nif (!/^sha256=[0-9a-f]{64}$/i.test(signature)) return reject('missing or malformed signature');\n\n// Verify over the exact raw bytes that were sent, never over re-serialised JSON.\nconst raw = (await this.helpers.getBinaryDataBuffer(0, 'data')).toString('utf8');\nconst expected = crypto.createHmac('sha256', secret).update(`${timestamp}.${raw}`).digest();\nconst given = Buffer.from(signature.slice(7), 'hex');\nif (given.length !== expected.length || !crypto.timingSafeEqual(given, expected)) return reject('bad signature');\n\nlet payload;\ntry { payload = JSON.parse(raw); } catch { return reject('body is not valid JSON'); }\nif (!payload.eventId || !payload.event || !payload.loan || !payload.recipient) return reject('payload is missing required fields');\n\nreturn [{ json: { valid: true, payload } }];"
+      },
+      "name": "Verify signature",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        220,
+        200
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "boolean": [
+            {
+              "value1": "={{ $json.valid }}",
+              "value2": true
+            }
+          ]
+        }
+      },
+      "name": "Signature valid?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 1,
+      "position": [
+        440,
+        200
+      ]
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ JSON.stringify({ error: 'unauthorized' }) }}",
+        "options": {
+          "responseCode": 401
+        }
+      },
+      "name": "Respond 401",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.1,
+      "position": [
+        660,
+        400
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "// n8n may be called more than once for the same event (Convex retries on timeouts).\n// Event ids are deterministic (`<loanId>:<event>`), so \"seen before\" is a simple lookup.\nconst store = $getWorkflowStaticData('global');\nstore.seen = store.seen || {};\nconst cutoff = Date.now() - 7 * 24 * 3600 * 1000;\nfor (const [id, at] of Object.entries(store.seen)) if (at < cutoff) delete store.seen[id];\n\nconst { payload } = $input.first().json;\nreturn [{ json: { payload, duplicate: Boolean(store.seen[payload.eventId]) } }];"
+      },
+      "name": "De-duplicate",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        660,
+        100
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "boolean": [
+            {
+              "value1": "={{ $json.duplicate }}",
+              "value2": true
+            }
+          ]
+        }
+      },
+      "name": "Already processed?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 1,
+      "position": [
+        880,
+        100
+      ]
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ JSON.stringify({ status: 'duplicate' }) }}",
+        "options": {
+          "responseCode": 200
+        }
+      },
+      "name": "Respond duplicate",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.1,
+      "position": [
+        1100,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "const { payload } = $input.first().json;\nconst { event, loan, recipient } = payload;\nconst clean = (s) => String(s ?? '').replace(/[\\r\\n]+/g, ' ').trim().slice(0, 80);\nconst name = clean(recipient.displayName) || 'there';\nconst tool = clean(loan.toolName);\nconst dates = loan.startDate === loan.endDate ? loan.startDate : `${loan.startDate} to ${loan.endDate}`;\n\nconst templates = {\n  'loan.requested': [`New request for your ${tool}`, `Hi ${name}, a neighbor would like to borrow your ${tool} (${dates}). Open LendLoop to approve or decline.`],\n  'loan.approved':  [`Your request for ${tool} was approved`, `Hi ${name}, good news: you can borrow the ${tool} (${dates}). Please return it on time.`],\n  'loan.declined':  [`Your request for ${tool} was declined`, `Hi ${name}, unfortunately the ${tool} is not available for ${dates}. Have a look at other listings on LendLoop.`],\n  'loan.returned':  [`${tool} marked as returned`, `Hi ${name}, the ${tool} was marked as returned. Thanks for being a good neighbor!`],\n  'loan.cancelled': [`Request for ${tool} was cancelled`, `Hi ${name}, the request for the ${tool} (${dates}) was cancelled.`],\n};\nconst t = templates[event];\nif (!t) throw new Error(`Unknown event type: ${clean(event)}`);\n\nreturn [{ json: { payload, message: { subject: t[0], text: t[1] } } }];"
+      },
+      "name": "Compose message",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1100,
+        200
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Notification channel. Default: log it (visible in the n8n execution).\n// If NOTIFY_WEBHOOK_URL is set (Slack / Mattermost / Discord-compatible), also POST it there.\nconst deliver = async (message) => {\n  console.log(`[lendloop notification] ${message.subject} :: ${message.text.replace(/\\n/g, ' ')}`);\n  const url = $env.NOTIFY_WEBHOOK_URL;\n  if (!url) return 'log';\n  await this.helpers.httpRequest({\n    method: 'POST', url, json: true, timeout: 8000,\n    body: { text: `*${message.subject}*\\n${message.text}`, content: `**${message.subject}**\\n${message.text}` },\n  });\n  return 'webhook';\n};\n\nconst { payload, message } = $input.first().json;\nconst channel = await deliver(message);\nreturn [{ json: { payload, channel } }];\n"
+      },
+      "name": "Send notification",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1320,
+        200
+      ],
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 2000
+    },
+    {
+      "parameters": {
+        "jsCode": "const { payload, channel } = $input.first().json;\nconst store = $getWorkflowStaticData('global');\nstore.seen = store.seen || {};\nstore.seen[payload.eventId] = Date.now();   // only after a successful delivery, so a failed attempt can be retried\nreturn [{ json: { status: 'delivered', eventId: payload.eventId, channel } }];"
+      },
+      "name": "Mark processed",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1540,
+        200
+      ]
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ JSON.stringify($json) }}",
+        "options": {
+          "responseCode": 200
+        }
+      },
+      "name": "Respond delivered",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.1,
+      "position": [
+        1760,
+        200
+      ]
+    }
+  ],
+  "connections": {
+    "Loan event webhook": {
+      "main": [
+        [
+          {
+            "node": "Verify signature",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Verify signature": {
+      "main": [
+        [
+          {
+            "node": "Signature valid?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Signature valid?": {
+      "main": [
+        [
+          {
+            "node": "De-duplicate",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Respond 401",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "De-duplicate": {
+      "main": [
+        [
+          {
+            "node": "Already processed?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Already processed?": {
+      "main": [
+        [
+          {
+            "node": "Respond duplicate",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Compose message",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Compose message": {
+      "main": [
+        [
+          {
+            "node": "Send notification",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Send notification": {
+      "main": [
+        [
+          {
+            "node": "Mark processed",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Mark processed": {
+      "main": [
+        [
+          {
+            "node": "Respond delivered",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1",
+    "errorWorkflow": "lendloop-error-handler",
+    "saveDataErrorExecution": "all",
+    "saveDataSuccessExecution": "all"
+  },
+  "pinData": {},
+  "meta": {
+    "templateCredsSetupCompleted": true
+  }
+}

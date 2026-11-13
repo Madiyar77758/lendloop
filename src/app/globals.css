@@ -1,0 +1,15 @@
+@import "tailwindcss";
+
+@theme {
+  --font-sans: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+  --color-ink: #1f2a24;
+  --color-paper: #faf8f3;
+  --color-moss: #2f5d46;
+  --color-moss-dark: #234637;
+  --color-clay: #b8562f;
+  --color-line: #e4dfd2;
+}
+
+html { background: var(--color-paper); color: var(--color-ink); }
+body { font-family: var(--font-sans); min-height: 100dvh; }
+:focus-visible { outline: 2px solid var(--color-moss); outline-offset: 2px; }

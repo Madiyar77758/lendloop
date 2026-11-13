@@ -1,0 +1,59 @@
+# Local n8n for LendLoop.
+#
+#   cp n8n/.env.example n8n/.env      # then fill in the secrets
+#   docker compose up -d              # n8n at http://localhost:5678 (editor bound to localhost only)
+#   docker compose --profile tunnel up -d   # also expose ONLY the loan-events webhook to the internet
+#
+# On every start the three workflows in n8n/workflows are imported and published, so the files in git
+# stay the source of truth (edits made in the n8n editor are overwritten on restart; export them back to the files).
+name: lendloop
+
+services:
+  n8n:
+    image: docker.n8n.io/n8nio/n8n:2.47.5   # the version the workflows were tested against
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:5678:5678"               # editor stays on localhost
+    env_file: ./n8n/.env
+    environment:
+      NODE_FUNCTION_ALLOW_BUILTIN: crypto           # Code nodes verify/compute HMAC with node:crypto
+      N8N_BLOCK_ENV_ACCESS_IN_NODE: "false"         # Code nodes read the two signing secrets from the environment
+      N8N_SECURE_COOKIE: "false"                    # local http only; set true behind HTTPS
+      N8N_DIAGNOSTICS_ENABLED: "false"
+      N8N_VERSION_NOTIFICATIONS_ENABLED: "false"
+      N8N_PERSONALIZATION_ENABLED: "false"
+      EXECUTIONS_DATA_PRUNE: "true"
+      EXECUTIONS_DATA_MAX_AGE: "336"                # keep two weeks of execution history
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        n8n import:workflow --separate --input=/workflows &&
+        n8n publish:workflow --id=lendloop-error-handler &&
+        n8n publish:workflow --id=lendloop-loan-events &&
+        n8n publish:workflow --id=lendloop-overdue-reminders &&
+        exec n8n start
+    volumes:
+      - n8n_data:/home/node/.n8n
+      - ./n8n/workflows:/workflows:ro
+
+  # Only the loan-events webhook is reachable through the tunnel: the editor, the REST API and every
+  # other n8n path answer 404. (A raw tunnel to n8n would expose the editor login to the internet.)
+  edge:
+    profiles: ["tunnel"]
+    image: caddy:2-alpine
+    restart: unless-stopped
+    volumes:
+      - ./n8n/Caddyfile:/etc/caddy/Caddyfile:ro
+    depends_on:
+      - n8n
+
+  tunnel:
+    profiles: ["tunnel"]
+    image: cloudflare/cloudflared:latest
+    restart: unless-stopped
+    command: tunnel --no-autoupdate --url http://edge:8080
+    depends_on:
+      - edge
+
+volumes:
+  n8n_data:

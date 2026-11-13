@@ -1,0 +1,15 @@
+:8080 {
+	@loan_events {
+		method POST
+		path /webhook/lendloop/loan-events
+	}
+	handle @loan_events {
+		request_body {
+			max_size 64KB
+		}
+		reverse_proxy n8n:5678
+	}
+	handle {
+		respond "Not found" 404
+	}
+}

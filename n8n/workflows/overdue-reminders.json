@@ -1,0 +1,265 @@
+{
+  "id": "lendloop-overdue-reminders",
+  "name": "LendLoop - Daily overdue reminders",
+  "active": true,
+  "nodes": [
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "days",
+              "daysInterval": 1,
+              "triggerAtHour": 9
+            }
+          ]
+        }
+      },
+      "name": "Every day at 09:00",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [
+        0,
+        100
+      ]
+    },
+    {
+      "parameters": {},
+      "name": "Run manually",
+      "type": "n8n-nodes-base.manualTrigger",
+      "typeVersion": 1,
+      "position": [
+        0,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "const crypto = require('crypto');\nconst secret = $env.AUTOMATION_API_SECRET;\nconst base = ($env.CONVEX_SITE_URL || '').replace(/\\/$/, '');\nif (!secret || !base) throw new Error('AUTOMATION_API_SECRET and CONVEX_SITE_URL must be set on the n8n container');\n// Signature = HMAC-SHA256 over `${unixSeconds}.${METHOD}.${path}.${rawBody}`\nconst signed = (method, path, body) => {\n  const ts = String(Math.floor(Date.now() / 1000));\n  const sig = 'sha256=' + crypto.createHmac('sha256', secret).update(`${ts}.${method}.${path}.${body}`).digest('hex');\n  return { url: base + path, ts, sig };\n};\n\nreturn [{ json: signed('GET', '/automation/overdue-loans', '') }];\n"
+      },
+      "name": "Sign request",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        240,
+        200
+      ]
+    },
+    {
+      "parameters": {
+        "method": "GET",
+        "url": "={{ $json.url }}",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "x-lendloop-timestamp",
+              "value": "={{ $json.ts }}"
+            },
+            {
+              "name": "x-lendloop-signature",
+              "value": "={{ $json.sig }}"
+            }
+          ]
+        },
+        "options": {
+          "timeout": 15000
+        }
+      },
+      "name": "Fetch overdue loans",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        460,
+        200
+      ],
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 3000
+    },
+    {
+      "parameters": {
+        "jsCode": "const { loans } = $input.first().json;\nconst today = new Date().toISOString().slice(0, 10);\nconst items = [];\n\nfor (const loan of loans || []) {\n  // A manual re-run on the same day must not remind people twice.\n  if (loan.lastReminderAt && new Date(loan.lastReminderAt).toISOString().slice(0, 10) === today) continue;\n\n  const clean = (s) => String(s ?? '').replace(/[\\r\\n]+/g, ' ').trim().slice(0, 80);\n  const days = loan.daysOverdue;\n  items.push({ json: {\n    loanId: loan.loanId,\n    today,\n    message: {\n      subject: `Reminder: please return the ${clean(loan.toolName)}`,\n      text: `Hi ${clean(loan.borrowerName) || 'there'}, the ${clean(loan.toolName)} was due on ${loan.dueDate} and is ${days} day${days === 1 ? '' : 's'} overdue. Please return it to its owner as soon as you can.`,\n    },\n  } });\n}\nreturn items;"
+      },
+      "name": "Prepare reminders",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        680,
+        200
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Notification channel. Default: log it (visible in the n8n execution).\n// If NOTIFY_WEBHOOK_URL is set (Slack / Mattermost / Discord-compatible), also POST it there.\nconst deliver = async (message) => {\n  console.log(`[lendloop notification] ${message.subject} :: ${message.text.replace(/\\n/g, ' ')}`);\n  const url = $env.NOTIFY_WEBHOOK_URL;\n  if (!url) return 'log';\n  await this.helpers.httpRequest({\n    method: 'POST', url, json: true, timeout: 8000,\n    body: { text: `*${message.subject}*\\n${message.text}`, content: `**${message.subject}**\\n${message.text}` },\n  });\n  return 'webhook';\n};\n\nconst sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));\nconst out = [];\n\n// One loan failing must not stop the others, so errors are caught per item and reported downstream.\nfor (const item of $input.all()) {\n  const { loanId, today, message } = item.json;\n  let channel = null, error = null;\n  for (let attempt = 1; attempt <= 3 && channel === null; attempt++) {\n    try { channel = await deliver(message); }\n    catch (e) { error = String(e.message || e).slice(0, 200); if (attempt < 3) await sleep(1500 * attempt); }\n  }\n  out.push({ json: {\n    loanId,\n    channel: channel ?? 'none',\n    status: channel ? 'sent' : 'failed',\n    error: channel ? null : error,\n    // Success and failure get different keys so that a failure never blocks a later successful reminder.\n    idempotencyKey: `${loanId}:${today}${channel ? '' : ':failed'}`,\n  } });\n}\nreturn out;\n"
+      },
+      "name": "Send reminders",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        900,
+        200
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "const crypto = require('crypto');\nconst secret = $env.AUTOMATION_API_SECRET;\nconst base = ($env.CONVEX_SITE_URL || '').replace(/\\/$/, '');\nif (!secret || !base) throw new Error('AUTOMATION_API_SECRET and CONVEX_SITE_URL must be set on the n8n container');\n// Signature = HMAC-SHA256 over `${unixSeconds}.${METHOD}.${path}.${rawBody}`\nconst signed = (method, path, body) => {\n  const ts = String(Math.floor(Date.now() / 1000));\n  const sig = 'sha256=' + crypto.createHmac('sha256', secret).update(`${ts}.${method}.${path}.${body}`).digest('hex');\n  return { url: base + path, ts, sig };\n};return $input.all().map((item) => {\n  const { loanId, idempotencyKey, channel, status, error } = item.json;\n  const body = JSON.stringify({ loanId, idempotencyKey, channel, status });\n  return { json: { ...signed('POST', '/automation/reminders', body), body, status, error } };\n});"
+      },
+      "name": "Sign write-back",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1120,
+        200
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $json.url }}",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "x-lendloop-timestamp",
+              "value": "={{ $json.ts }}"
+            },
+            {
+              "name": "x-lendloop-signature",
+              "value": "={{ $json.sig }}"
+            }
+          ]
+        },
+        "options": {
+          "timeout": 15000
+        },
+        "sendBody": true,
+        "contentType": "raw",
+        "rawContentType": "application/json",
+        "body": "={{ $json.body }}"
+      },
+      "name": "Record reminder in Convex",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        1340,
+        200
+      ],
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 3000
+    },
+    {
+      "parameters": {
+        "jsCode": "const failed = $('Send reminders').all().filter((i) => i.json.status === 'failed');\nif (failed.length > 0) {\n  throw new Error(`${failed.length} reminder(s) could not be delivered: ${failed.map((i) => `${i.json.loanId} (${i.json.error})`).join('; ')}`);\n}\nreturn [{ json: { reminded: $('Send reminders').all().length } }];"
+      },
+      "name": "Fail if any delivery failed",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1560,
+        200
+      ]
+    }
+  ],
+  "connections": {
+    "Every day at 09:00": {
+      "main": [
+        [
+          {
+            "node": "Sign request",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Run manually": {
+      "main": [
+        [
+          {
+            "node": "Sign request",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Sign request": {
+      "main": [
+        [
+          {
+            "node": "Fetch overdue loans",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Fetch overdue loans": {
+      "main": [
+        [
+          {
+            "node": "Prepare reminders",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Prepare reminders": {
+      "main": [
+        [
+          {
+            "node": "Send reminders",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Send reminders": {
+      "main": [
+        [
+          {
+            "node": "Sign write-back",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Sign write-back": {
+      "main": [
+        [
+          {
+            "node": "Record reminder in Convex",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Record reminder in Convex": {
+      "main": [
+        [
+          {
+            "node": "Fail if any delivery failed",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1",
+    "errorWorkflow": "lendloop-error-handler",
+    "saveDataErrorExecution": "all",
+    "saveDataSuccessExecution": "all"
+  },
+  "pinData": {},
+  "meta": {
+    "templateCredsSetupCompleted": true
+  }
+}
