@@ -1,5 +1,7 @@
 # LendLoop
 
+[![CI](https://github.com/Madiyar77758/lendloop/actions/workflows/ci.yml/badge.svg)](https://github.com/Madiyar77758/lendloop/actions/workflows/ci.yml)
+
 > **Borrow what you need. Lend what you don't.**
 
 A neighborhood board for lending tools. Neighbors list what they own, others request it for a date range, the owner approves or declines, and an n8n automation keeps everybody informed (including a daily reminder when something is overdue).
